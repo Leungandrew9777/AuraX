@@ -1,434 +1,451 @@
 """
-Project Augo - Machine Learning Base Model
-XGBoost classifier with Walk-Forward Validation and Probability Calibration.
+XGBoost Base Model with Walk-Forward Validation
+TimeSeriesSplit, probability calibration, and feature engineering
+Windows-optimized implementation
 """
-import numpy as np
 import polars as pl
-from typing import Tuple, List, Dict, Optional
+import numpy as np
+from typing import Dict, List, Tuple, Optional, Any
+from datetime import datetime
+import logging
+import joblib
+from pathlib import Path
+
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import brier_score_loss, log_loss, classification_report
 import xgboost as xgb
-import logging
-from datetime import datetime
-
-from config.settings import config
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class FeatureEngineer:
+class EPLMatchPredictor:
     """
-    Creates rolling features and team-specific statistics for ML modeling.
+    XGBoost multi-class classifier for EPL match outcomes.
     
-    All features are designed to avoid look-ahead bias by only using
-    historical data available before each match.
+    Features:
+    - Rolling averages (last 5 matches)
+    - Head-to-head statistics
+    - Home/away form splits
+    
+    Validation:
+    - TimeSeriesSplit (walk-forward) to prevent look-ahead bias
+    - Isotonic regression calibration for reliable probabilities
     """
     
-    def __init__(self, window_sizes: List[int] = None):
-        self.window_sizes = window_sizes or [3, 5, 10]  # Rolling windows
+    FEATURE_COLUMNS = [
+        # Home team rolling features
+        'home_rolling_goals_avg',
+        'home_rolling_goals_conceded_avg',
+        'home_rolling_shot_accuracy_avg',
+        'home_rolling_points_avg',
+        'home_rolling_form_diff',
+        
+        # Away team rolling features  
+        'away_rolling_goals_avg',
+        'away_rolling_goals_conceded_avg',
+        'away_rolling_shot_accuracy_avg',
+        'away_rolling_points_avg',
+        'away_rolling_form_diff',
+        
+        # Relative strength
+        'goal_diff_advantage',
+        'shot_accuracy_advantage',
+        'form_advantage',
+        
+        # Home advantage indicator
+        'is_home',  # Always 1 for training, used differently in prediction
+    ]
     
-    def create_rolling_features(self, df: pl.DataFrame) -> pl.DataFrame:
+    def __init__(
+        self,
+        n_estimators: int = 500,
+        max_depth: int = 6,
+        learning_rate: float = 0.05,
+        n_splits: int = 5,
+        random_state: int = 42,
+        model_dir: Optional[Path] = None
+    ):
         """
-        Create rolling average features for each team.
+        Initialize the XGBoost predictor.
         
-        Features include:
-        - Goals scored/conceded per match (rolling)
-        - Shot accuracy (shots on target / total shots)
-        - Form points (last N matches)
-        - Home/away specific stats
+        Args:
+            n_estimators: Number of boosting rounds
+            max_depth: Maximum tree depth
+            learning_rate: Step size shrinkage
+            n_splits: Number of folds for TimeSeriesSplit
+            random_state: Random seed for reproducibility
+            model_dir: Directory to save/load models
         """
-        df_features = df.clone()
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.n_splits = n_splits
+        self.random_state = random_state
         
-        # Sort by date for proper rolling calculations
-        df_features = df_features.sort('match_date')
+        if model_dir is None:
+            import os
+            model_dir = Path(os.environ.get("LOCALAPPDATA", ".")) / "ProjectAugo" / "models"
         
-        # Create team-level dataframe (home and away separately)
-        home_stats = self._calculate_team_rolling_stats(
-            df, 
-            team_col='HomeTeam', 
-            opponent_col='AwayTeam',
-            goals_col='FTHG',
-            conceded_col='FTAG',
-            shots_col='HS',
-            shots_on_target_col='HST',
-            result_col='FTR',
-            is_home=True
+        self.model_dir = model_dir
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Base XGBoost classifier
+        self.base_model = xgb.XGBClassifier(
+            objective='multi:softprob',
+            num_class=3,  # Home, Draw, Away
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            random_state=random_state,
+            eval_metric='mlogloss',
+            early_stopping_rounds=50,
+            verbosity=0
         )
         
-        away_stats = self._calculate_team_rolling_stats(
-            df,
-            team_col='AwayTeam',
-            opponent_col='HomeTeam', 
-            goals_col='FTAG',
-            conceded_col='FTHG',
-            shots_col='AS',
-            shots_on_target_col='AST',
-            result_col='FTR',
-            is_home=False
-        )
+        # Calibrated wrapper (isotonic regression)
+        self.calibrated_model = None
         
-        # Merge back to original dataframe
-        df_features = df_features.join(
-            home_stats,
-            left_on=['match_date', 'HomeTeam'],
-            right_on=['match_date', 'team'],
-            how='left',
-            suffix='_home'
-        )
+        # Feature importance cache
+        self._feature_importance = None
         
-        df_features = df_features.join(
-            away_stats,
-            left_on=['match_date', 'AwayTeam'],
-            right_on=['match_date', 'team'],
-            how='left',
-            suffix='_away'
-        )
-        
-        # Drop intermediate columns
-        cols_to_drop = [col for col in df_features.columns if col.endswith('_home') or col.endswith('_away')]
-        # Keep only the renamed columns
-        
-        logger.info(f"Created rolling features. Shape: {df_features.shape}")
-        return df_features
+        # Training metrics
+        self.training_metrics = {}
     
-    def _calculate_team_rolling_stats(self, df: pl.DataFrame, team_col: str,
-                                       opponent_col: str, goals_col: str,
-                                       conceded_col: str, shots_col: str,
-                                       shots_on_target_col: str,
-                                       result_col: str, is_home: bool) -> pl.DataFrame:
-        """Calculate rolling statistics for a team."""
+    def engineer_features(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Create rolling features and derived statistics from raw match data.
         
-        # Create long-format dataframe with team perspective
-        home_df = df.select([
-            pl.col('match_date'),
-            pl.col(team_col).alias('team'),
-            pl.col(opponent_col).alias('opponent'),
-            pl.col(goals_col).alias('goals_scored'),
-            pl.col(conceded_col).alias('goals_conceded'),
-            pl.col(shots_col).alias('shots'),
-            pl.col(shots_on_target_col).alias('shots_on_target'),
-            pl.col(result_col).alias('result'),
-            pl.lit(is_home).alias('is_home_match')
+        This is the critical step that transforms raw match stats into
+        ML-ready features while avoiding look-ahead bias.
+        """
+        logger.info("Engineering features...")
+        
+        # Sort by date (critical for rolling calculations)
+        df = df.sort('match_date')
+        
+        # Create unique match identifier
+        df = df.with_columns(
+            (pl.col('match_date').cast(pl.String) + '_' + 
+             pl.col('home_team') + '_' + 
+             pl.col('away_team')).alias('match_id')
+        )
+        
+        # Calculate rolling features for each team
+        df = self._add_team_rolling_features(df, 'home')
+        df = self._add_team_rolling_features(df, 'away')
+        
+        # Create relative advantage features
+        df = df.with_columns([
+            (pl.col('home_rolling_goals_avg') - pl.col('away_rolling_goals_avg')).alias('goal_diff_advantage'),
+            (pl.col('home_rolling_shot_accuracy_avg') - pl.col('away_rolling_shot_accuracy_avg')).alias('shot_accuracy_advantage'),
+            (pl.col('home_rolling_points_avg') - pl.col('away_rolling_points_avg')).alias('form_advantage'),
         ])
         
-        # Calculate points (3 for win, 1 for draw, 0 for loss)
-        home_df = home_df.with_columns(
-            pl.when(pl.col('result') == ('H' if is_home else 'A'))
-                .then(3)
-                .when(pl.col('result') == 'D')
-                .then(1)
-                .otherwise(0)
-            .alias('points')
-        )
+        # Add home indicator
+        df = df.with_columns(pl.lit(1).alias('is_home'))
         
-        # Calculate shot accuracy
-        home_df = home_df.with_columns(
-            pl.when(pl.col('shots') > 0)
-                .then(pl.col('shots_on_target') / pl.col('shots'))
-                .otherwise(0.0)
-            .alias('shot_accuracy')
-        )
+        # Create target variable (H=0, D=1, A=2)
+        if 'ft_result' in df.columns:
+            df = df.with_columns(
+                pl.when(pl.col('ft_result') == 'H').then(0)
+                .when(pl.col('ft_result') == 'D').then(1)
+                .when(pl.col('ft_result') == 'A').then(2)
+                .otherwise(None).alias('target')
+            )
         
-        # Calculate rolling averages for each window size
-        rolling_dfs = []
-        for window in self.window_sizes:
-            rolled = home_df.sort('match_date').group_by('team', maintain_order=True).agg([
-                pl.col('goals_scored').tail(window).mean().alias(f'rolling_goals_scored_{window}'),
-                pl.col('goals_conceded').tail(window).mean().alias(f'rolling_goals_conceded_{window}'),
-                pl.col('points').tail(window).sum().alias(f'rolling_form_{window}'),
-                pl.col('shot_accuracy').tail(window).mean().alias(f'rolling_shot_accuracy_{window}'),
-                (pl.col('goals_scored').tail(window).mean() - pl.col('goals_conceded').tail(window).mean())
-                    .alias(f'rolling_goal_diff_{window}')
-            ])
-            rolling_dfs.append(rolled)
-        
-        # Combine all rolling features
-        if rolling_dfs:
-            combined = rolling_dfs[0]
-            for rdf in rolling_dfs[1:]:
-                combined = combined.join(rdf, on=['team', 'match_date'], how='left')
-            
-            # Shift by 1 to avoid look-ahead bias (exclude current match)
-            combined = combined.sort('team', 'match_date').with_columns([
-                pl.col(col).shift(1).alias(f'{col}_lag1')
-                for col in combined.columns if col.startswith('rolling_')
-            ])
-            
-            return combined
-        
-        return home_df
+        return df
     
-    def create_head_to_head_features(self, df: pl.DataFrame, h2h_window: int = 5) -> pl.DataFrame:
-        """Create head-to-head historical features between teams."""
-        # This would calculate historical performance between specific team matchups
-        # Simplified version for now
-        df_h2h = df.clone()
-        
-        # Add a simple H2H indicator (number of previous meetings)
-        df_h2h = df_h2h.with_columns(
-            pl.lit(0).alias('h2h_meetings_count')  # Placeholder
-        )
-        
-        return df_h2h
-    
-    def prepare_features_for_prediction(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Prepare final feature matrix for model training/prediction."""
-        # First create rolling features
-        df_final = self.create_rolling_features(df)
-        
-        # Add H2H features
-        df_final = self.create_head_to_head_features(df_final)
-        
-        return df_final
-
-
-class XGBoostModel:
-    """
-    XGBoost multi-class classifier with walk-forward validation
-    and probability calibration.
-    """
-    
-    def __init__(self, model_config=None):
-        self.config = model_config or config.model
-        self.model = None
-        self.calibrated_model = None
-        self.feature_engineer = FeatureEngineer()
-        self.feature_names = None
-        self.classes_ = ['home_win', 'draw', 'away_win']
-        
-        # Training history
-        self.eval_results = {}
-        self.walk_forward_metrics = []
-    
-    def _prepare_xy(self, df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """Prepare feature matrix X and target vector y."""
-        # Define feature columns (exclude non-feature columns)
-        exclude_cols = [
-            'Date', 'match_date', 'HomeTeam', 'AwayTeam', 'FTR',
-            'season_code', 'season_name', 'ingested_at', 'result_encoded',
-            'B365H', 'B365D', 'B365A',  # Odds (used separately)
-            'fair_prob_home', 'fair_prob_draw', 'fair_prob_away'  # Derived probs
-        ]
-        
-        # Filter to numeric feature columns only
-        feature_cols = [
-            col for col in df.columns
-            if col not in exclude_cols and df.schema.get(col) in [pl.Float32, pl.Float64, pl.Int32, pl.Int64, pl.Int16, pl.Int8]
-        ]
-        
-        self.feature_names = feature_cols
-        
-        # Prepare X
-        X = df.select(feature_cols).fill_null(0).to_numpy()
-        
-        # Prepare y (encode target)
-        result_mapping = {'H': 0, 'D': 1, 'A': 2, 'home_win': 0, 'draw': 1, 'away_win': 2}
-        y = df['FTR'].apply(lambda x: result_mapping.get(x, -1)).to_numpy()
-        
-        # Filter out invalid targets
-        valid_mask = y >= 0
-        X = X[valid_mask]
-        y = y[valid_mask]
-        
-        return X, y
-    
-    def train_walk_forward(self, df: pl.DataFrame) -> Dict:
+    def _add_team_rolling_features(self, df: pl.DataFrame, location: str) -> pl.DataFrame:
         """
-        Train model using walk-forward validation (TimeSeriesSplit).
+        Add rolling window features for a team (home or away).
         
-        This completely eliminates look-ahead bias by ensuring that
-        test data always comes after training data chronologically.
+        Uses shift() to ensure no look-ahead bias - only past matches are used.
+        """
+        team_col = f'{location}_team'
+        goals_col = 'ft_home_goals' if location == 'home' else 'ft_away_goals'
+        conceded_col = 'ft_away_goals' if location == 'home' else 'ft_home_goals'
+        
+        # Group by team and calculate rolling stats
+        rolling_window = 5
+        
+        # Goals scored rolling average
+        df = df.with_columns(
+            pl.col(goals_col).over(team_col).shift(1).rolling_mean(window_size=rolling_window).alias(f'{location}_rolling_goals_avg')
+        )
+        
+        # Goals conceded rolling average
+        df = df.with_columns(
+            pl.col(conceded_col).over(team_col).shift(1).rolling_mean(window_size=rolling_window).alias(f'{location}_rolling_goals_conceded_avg')
+        )
+        
+        # Shot accuracy rolling average
+        shot_acc_col = f'{location}_shot_accuracy'
+        if shot_acc_col in df.columns:
+            df = df.with_columns(
+                pl.col(shot_acc_col).over(team_col).shift(1).rolling_mean(window_size=rolling_window).alias(f'{location}_rolling_shot_accuracy_avg')
+            )
+        else:
+            # Calculate shot accuracy if not present
+            shots_col = 'home_shots' if location == 'home' else 'away_shots'
+            sot_col = 'home_shots_on_target' if location == 'home' else 'away_shots_on_target'
+            
+            if shots_col in df.columns and sot_col in df.columns:
+                shot_acc = (pl.col(sot_col) / pl.col(shots_col).clip(lower_bound=1))
+                df = df.with_columns(
+                    shot_acc.over(team_col).shift(1).rolling_mean(window_size=rolling_window).alias(f'{location}_rolling_shot_accuracy_avg')
+                )
+        
+        # Points rolling average (3 for win, 1 for draw, 0 for loss)
+        result_col = 'ft_result'
+        if result_col in df.columns:
+            points = pl.when(pl.col(result_col) == ('H' if location == 'home' else 'A')).then(3)\
+                     .when(pl.col(result_col) == 'D').then(1)\
+                     .otherwise(0)
+            
+            df = df.with_columns(
+                points.over(team_col).shift(1).rolling_mean(window_size=rolling_window).alias(f'{location}_rolling_points_avg')
+            )
+        
+        # Form difference (recent goal difference trend)
+        goal_diff = pl.col(goals_col) - pl.col(conceded_col)
+        df = df.with_columns(
+            goal_diff.over(team_col).shift(1).rolling_mean(window_size=rolling_window).alias(f'{location}_rolling_form_diff')
+        )
+        
+        # Fill NaN values with league averages
+        fill_cols = [c for c in df.columns if c.startswith(f'{location}_rolling')]
+        for col in fill_cols:
+            mean_val = df[col].mean()
+            if mean_val is not None and not np.isnan(mean_val):
+                df = df.with_columns(pl.col(col).fill_null(mean_val))
+        
+        return df
+    
+    def train_with_walk_forward(
+        self,
+        df: pl.DataFrame,
+        use_calibration: bool = True
+    ) -> Dict[str, float]:
+        """
+        Train using TimeSeriesSplit (walk-forward validation).
+        
+        This completely eliminates look-ahead bias by ensuring each test fold
+        only uses training data from earlier time periods.
         
         Returns:
-            Dictionary with aggregated metrics across all folds
+            Dictionary with validation metrics
         """
         logger.info("Starting walk-forward validation training...")
         
-        # Prepare features
-        df_features = self.feature_engine.prepare_features_for_prediction(df)
-        X, y = self._prepare_xy(df_features)
+        # Engineer features
+        df_features = self.engineer_features(df.clone())
         
-        logger.info(f"Prepared {len(X)} samples with {len(self.feature_names)} features")
+        # Drop rows with null targets or features
+        df_clean = df_features.filter(
+            pl.col('target').is_not_null() & 
+            pl.all_horizontal([pl.col(c).is_not_null() for c in self.FEATURE_COLUMNS])
+        )
         
-        # Time series split
-        n_splits = self.config.n_splits
-        tscv = TimeSeriesSplit(n_splits=n_splits, test_size=self.config.test_size, gap=0)
+        if len(df_clean) < 100:
+            raise ValueError(f"Insufficient data after cleaning: {len(df_clean)} rows")
         
+        logger.info(f"Training on {len(df_clean)} matches")
+        
+        # Prepare data
+        X = df_clean.select(self.FEATURE_COLUMNS).to_numpy()
+        y = df_clean['target'].to_numpy()
+        
+        # TimeSeriesSplit for walk-forward validation
+        tscv = TimeSeriesSplit(n_splits=self.n_splits)
+        
+        all_probs = []
+        all_true = []
         fold_metrics = []
-        predictions_all_folds = []
         
-        for fold_idx, (train_idx, test_idx) in enumerate(tscv.split(X)):
-            logger.info(f"Training fold {fold_idx + 1}/{n_splits}")
+        for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
+            logger.info(f"Fold {fold + 1}/{self.n_splits}")
             
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
             
-            # Train base XGBoost model
-            base_model = xgb.XGBClassifier(
-                n_estimators=self.config.xgb_n_estimators,
-                max_depth=self.config.xgb_max_depth,
-                learning_rate=self.config.xgb_learning_rate,
-                subsample=self.config.xgb_subsample,
-                colsample_bytree=self.config.xgb_colsample_bytree,
-                random_state=self.config.xgb_random_state,
-                objective='multi:softprob',
-                num_class=3,
-                eval_metric='mlogloss',
-                early_stopping_rounds=50,
-                verbosity=1
-            )
-            
-            # Fit with validation set
-            base_model.fit(
+            # Train base model
+            self.base_model.fit(
                 X_train, y_train,
                 eval_set=[(X_test, y_test)],
                 verbose=False
             )
             
-            # Get uncalibrated predictions
-            y_pred_proba_uncal = base_model.predict_proba(X_test)
+            # Predict probabilities
+            if use_calibration:
+                # Use calibrated model
+                cal_model = CalibratedClassifierCV(
+                    self.base_model,
+                    method='isotonic',
+                    cv='prefit'  # Already trained
+                )
+                cal_model.fit(X_test, y_test)
+                probs = cal_model.predict_proba(X_test)
+            else:
+                probs = self.base_model.predict_proba(X_test)
             
-            # Calibrate probabilities using isotonic regression
-            calibrated = CalibratedClassifierCV(
-                estimator=base_model,
-                method='isotonic',
-                cv='prefit'  # Use prefit since we already trained
-            )
-            calibrated.fit(X_test, y_test)  # Fit calibrator on test set
+            # Store for overall metrics
+            all_probs.append(probs)
+            all_true.append(y_test)
             
-            # Get calibrated predictions
-            y_pred_proba_cal = calibrated.predict_proba(X_test)
-            y_pred = calibrated.predict(X_test)
+            # Fold metrics
+            preds = np.argmax(probs, axis=1)
+            fold_brier = brier_score_loss(y_test, probs[np.arange(len(y_test)), preds])
+            fold_logloss = log_loss(y_test, probs)
             
-            # Calculate metrics
-            metrics = {
-                'fold': fold_idx,
-                'brier_score': self._calculate_brier_score(y_test, y_pred_proba_cal),
-                'log_loss': log_loss(y_test, y_pred_proba_cal),
-                'accuracy': (y_pred == y_test).mean(),
-                'n_test_samples': len(y_test)
-            }
-            
-            fold_metrics.append(metrics)
-            predictions_all_folds.append({
-                'y_true': y_test,
-                'y_pred_proba': y_pred_proba_cal,
-                'y_pred': y_pred
+            fold_metrics.append({
+                'brier': fold_brier,
+                'logloss': fold_logloss
             })
             
-            logger.info(f"Fold {fold_idx + 1} - Brier: {metrics['brier_score']:.4f}, Log Loss: {metrics['log_loss']:.4f}")
+            logger.info(f"  Brier: {fold_brier:.4f}, LogLoss: {fold_logloss:.4f}")
         
-        # Aggregate metrics
-        aggregated_metrics = {
-            'mean_brier_score': np.mean([m['brier_score'] for m in fold_metrics]),
-            'std_brier_score': np.std([m['brier_score'] for m in fold_metrics]),
-            'mean_log_loss': np.mean([m['log_loss'] for m in fold_metrics]),
-            'mean_accuracy': np.mean([m['accuracy'] for m in fold_metrics]),
-            'fold_metrics': fold_metrics
+        # Combine all folds
+        all_probs_np = np.vstack(all_probs)
+        all_true_np = np.concatenate(all_true)
+        
+        # Overall metrics
+        overall_brier = brier_score_loss(all_true_np, all_probs_np[np.arange(len(all_true_np)), np.argmax(all_probs_np, axis=1)])
+        overall_logloss = log_loss(all_true_np, all_probs_np)
+        
+        self.training_metrics = {
+            'brier_score': overall_brier,
+            'log_loss': overall_logloss,
+            'fold_metrics': fold_metrics,
+            'n_samples': len(df_clean),
+            'feature_columns': self.FEATURE_COLUMNS
         }
         
-        self.walk_forward_metrics = fold_metrics
+        logger.info(f"\n✓ Walk-forward validation complete")
+        logger.info(f"Overall Brier Score: {overall_brier:.4f}")
+        logger.info(f"Overall Log Loss: {overall_logloss:.4f}")
         
-        logger.info(f"Walk-forward validation complete.")
-        logger.info(f"Mean Brier Score: {aggregated_metrics['mean_brier_score']:.4f} (+/- {aggregated_metrics['std_brier_score']:.4f})")
-        logger.info(f"Mean Log Loss: {aggregated_metrics['mean_log_loss']:.4f}")
-        logger.info(f"Mean Accuracy: {aggregated_metrics['mean_accuracy']:.4f}")
+        # Final training on full dataset for deployment
+        logger.info("Training final model on full dataset...")
+        self.base_model.fit(X, y, verbose=False)
         
-        return aggregated_metrics
+        if use_calibration:
+            self.calibrated_model = CalibratedClassifierCV(
+                self.base_model,
+                method='isotonic',
+                cv='prefit'
+            )
+            self.calibrated_model.fit(X, y)
+            logger.info("✓ Probability calibration applied (Isotonic Regression)")
+        
+        # Save model
+        self.save_model()
+        
+        return self.training_metrics
     
-    def _calculate_brier_score(self, y_true: np.ndarray, y_proba: np.ndarray) -> float:
-        """Calculate multi-class Brier score."""
-        # One-hot encode true labels
-        n_classes = y_proba.shape[1]
-        y_onehot = np.zeros_like(y_proba)
-        y_onehot[np.arange(len(y_true)), y_true] = 1
-        
-        # Brier score = mean squared error between probabilities and one-hot
-        return np.mean(np.sum((y_proba - y_onehot) ** 2, axis=1))
-    
-    def fit_final_model(self, df: pl.DataFrame) -> None:
+    def predict_probabilities(
+        self,
+        match_data: pl.DataFrame
+    ) -> np.ndarray:
         """
-        Train final model on all available data.
-        
-        This model will be used for actual predictions.
-        """
-        logger.info("Training final model on all data...")
-        
-        df_features = self.feature_engineer.prepare_features_for_prediction(df)
-        X, y = self._prepare_xy(df_features)
-        
-        # Train base model
-        self.model = xgb.XGBClassifier(
-            n_estimators=self.config.xgb_n_estimators,
-            max_depth=self.config.xgb_max_depth,
-            learning_rate=self.config.xgb_learning_rate,
-            subsample=self.config.xgb_subsample,
-            colsample_bytree=self.config.xgb_colsample_bytree,
-            random_state=self.config.xgb_random_state,
-            objective='multi:softprob',
-            num_class=3,
-            verbosity=1
-        )
-        
-        self.model.fit(X, y)
-        
-        # Calibrate using cross-validation
-        self.calibrated_model = CalibratedClassifierCV(
-            estimator=self.model,
-            method='isotonic',
-            cv=5
-        )
-        self.calibrated_model.fit(X, y)
-        
-        logger.info("Final model training complete")
-    
-    def predict_proba(self, df: pl.DataFrame) -> np.ndarray:
-        """
-        Predict calibrated probabilities for new data.
+        Predict outcome probabilities for new matches.
         
         Returns:
-            Array of shape (n_matches, 3) with probabilities for [home, draw, away]
+            Array of shape (n_matches, 3) with [P(Home), P(Draw), P(Away)]
         """
-        if self.calibrated_model is None:
-            raise ValueError("Model not trained. Call fit_final_model first.")
+        # Engineer features for new data
+        df_features = self.engineer_features(match_data.clone())
         
-        df_features = self.feature_engine.prepare_features_for_prediction(df)
-        X, _ = self._prepare_xy(df_features)
+        # Select feature columns
+        X = df_features.select(self.FEATURE_COLUMNS).to_numpy()
         
-        return self.calibrated_model.predict_proba(X)
+        # Use calibrated model if available
+        if self.calibrated_model:
+            probs = self.calibrated_model.predict_proba(X)
+        else:
+            probs = self.base_model.predict_proba(X)
+        
+        return probs
     
     def get_feature_importance(self) -> Dict[str, float]:
-        """Get feature importance from the trained model."""
-        if self.model is None:
-            return {}
+        """Get feature importance scores"""
+        if self._feature_importance is None:
+            importance = self.base_model.feature_importances_
+            self._feature_importance = dict(zip(self.FEATURE_COLUMNS, importance.tolist()))
         
-        importance = self.model.feature_importances_
-        return dict(zip(self.feature_names, importance))
+        return self._feature_importance
     
-    def save_model(self, filepath: str) -> None:
-        """Save model to file."""
-        import pickle
-        with open(filepath, 'wb') as f:
-            pickle.dump({
-                'model': self.model,
-                'calibrated_model': self.calibrated_model,
-                'feature_names': self.feature_names,
-                'walk_forward_metrics': self.walk_forward_metrics
-            }, f)
-        logger.info(f"Model saved to {filepath}")
+    def save_model(self, filename: str = "epl_xgb_model.joblib"):
+        """Save model to disk"""
+        model_path = self.model_dir / filename
+        joblib.dump({
+            'base_model': self.base_model,
+            'calibrated_model': self.calibrated_model,
+            'feature_columns': self.FEATURE_COLUMNS,
+            'training_metrics': self.training_metrics
+        }, model_path)
+        logger.info(f"✓ Model saved to {model_path}")
+        return model_path
     
-    def load_model(self, filepath: str) -> None:
-        """Load model from file."""
-        import pickle
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
+    def load_model(self, filename: str = "epl_xgb_model.joblib"):
+        """Load model from disk"""
+        model_path = self.model_dir / filename
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model not found: {model_path}")
         
-        self.model = data['model']
+        data = joblib.load(model_path)
+        self.base_model = data['base_model']
         self.calibrated_model = data['calibrated_model']
-        self.feature_names = data['feature_names']
-        self.walk_forward_metrics = data.get('walk_forward_metrics', [])
+        self.FEATURE_COLUMNS = data['feature_columns']
+        self.training_metrics = data['training_metrics']
         
-        logger.info(f"Model loaded from {filepath}")
+        logger.info(f"✓ Model loaded from {model_path}")
+        return self
+    
+    def print_classification_report(self, df: pl.DataFrame) -> str:
+        """Generate detailed classification report"""
+        df_features = self.engineer_features(df.clone())
+        df_clean = df_features.filter(
+            pl.col('target').is_not_null() &
+            pl.all_horizontal([pl.col(c).is_not_null() for c in self.FEATURE_COLUMNS])
+        )
+        
+        X = df_clean.select(self.FEATURE_COLUMNS).to_numpy()
+        y = df_clean['target'].to_numpy()
+        
+        probs = self.predict_probabilities(df_clean.to_pandas())
+        preds = np.argmax(probs, axis=1)
+        
+        target_names = ['Home Win', 'Draw', 'Away Win']
+        report = classification_report(y, preds, target_names=target_names)
+        
+        return report
+
+
+# Example usage
+if __name__ == "__main__":
+    # Create sample data for testing
+    np.random.seed(42)
+    n_matches = 500
+    
+    sample_data = pl.DataFrame({
+        'match_date': pl.date_range(datetime(2022, 8, 1), datetime(2024, 5, 1), interval='7d', eager=True)[:n_matches],
+        'home_team': np.random.choice(['Arsenal', 'Chelsea', 'Liverpool', 'Man City'], n_matches),
+        'away_team': np.random.choice(['Arsenal', 'Chelsea', 'Liverpool', 'Man City'], n_matches),
+        'ft_home_goals': np.random.poisson(1.5, n_matches),
+        'ft_away_goals': np.random.poisson(1.2, n_matches),
+        'ft_result': np.random.choice(['H', 'D', 'A'], n_matches),
+        'home_shots': np.random.randint(5, 20, n_matches),
+        'away_shots': np.random.randint(5, 20, n_matches),
+        'home_shots_on_target': np.random.randint(2, 10, n_matches),
+        'away_shots_on_target': np.random.randint(2, 10, n_matches),
+    })
+    
+    # Initialize and train
+    predictor = EPLMatchPredictor(n_estimators=100, n_splits=3)
+    metrics = predictor.train_with_walk_forward(sample_data)
+    
+    print(f"\nFeature Importance:")
+    for feat, imp in sorted(predictor.get_feature_importance().items(), key=lambda x: -x[1])[:5]:
+        print(f"  {feat}: {imp:.4f}")

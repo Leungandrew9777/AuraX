@@ -1,15 +1,15 @@
 """
-Project Augo - Database Schema and Connection Management
-PostgreSQL + TimescaleDB setup for time-series match data.
+Database Schema and Connection Management
+PostgreSQL + TimescaleDB setup for Project Augo
+Windows-optimized with connection pooling
 """
 import psycopg2
-from psycopg2 import sql, extras
-from typing import Optional, List, Dict
-import logging
+from psycopg2 import pool, sql
+from psycopg2.extras import RealDictCursor
+from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
-
-from config.settings import config
-
+import logging
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,470 +19,431 @@ class DatabaseManager:
     """
     Manages PostgreSQL/TimescaleDB connections and schema operations.
     
-    Provides idempotent table creation and efficient batch operations
-    for both match data and qualitative signals.
+    Tables:
+    - matches: Core match data
+    - odds: Historical bookmaker odds
+    - llm_qualitative_signals: LLM-parsed metrics
+    - model_predictions: ML model outputs
     """
     
     # Table creation SQL statements
-    CREATE_MATCHES_TABLE = """
+    SCHEMA_SQL = """
+    -- Enable TimescaleDB extension (if not already enabled)
+    CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+    
+    -- Matches table (hypertable for time-series)
     CREATE TABLE IF NOT EXISTS matches (
-        match_id SERIAL PRIMARY KEY,
+        id SERIAL PRIMARY KEY,
         match_date DATE NOT NULL,
-        season_code VARCHAR(10) NOT NULL,
-        home_team VARCHAR(50) NOT NULL,
-        away_team VARCHAR(50) NOT NULL,
-        
-        -- Half-time stats
-        ht_home_goals INTEGER DEFAULT 0,
-        ht_away_goals INTEGER DEFAULT 0,
-        
-        -- Full-time stats
-        ft_home_goals INTEGER DEFAULT 0,
-        ft_away_goals INTEGER DEFAULT 0,
-        result VARCHAR(20),  -- home_win, draw, away_win
-        
-        -- Match statistics
-        home_shots INTEGER DEFAULT 0,
-        away_shots INTEGER DEFAULT 0,
-        home_shots_on_target INTEGER DEFAULT 0,
-        away_shots_on_target INTEGER DEFAULT 0,
-        home_corners INTEGER DEFAULT 0,
-        away_corners INTEGER DEFAULT 0,
-        home_yellow_cards INTEGER DEFAULT 0,
-        away_yellow_cards INTEGER DEFAULT 0,
-        home_red_cards INTEGER DEFAULT 0,
-        away_red_cards INTEGER DEFAULT 0,
-        
-        -- Derived features
-        goal_difference INTEGER DEFAULT 0,
-        total_goals INTEGER DEFAULT 0,
-        
-        -- Timestamps
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW(),
-        
-        -- Unique constraint to prevent duplicates
-        UNIQUE(match_date, home_team, away_team)
+        home_team VARCHAR(100) NOT NULL,
+        away_team VARCHAR(100) NOT NULL,
+        ft_home_goals INTEGER,
+        ft_away_goals INTEGER,
+        ht_home_goals INTEGER,
+        ht_away_goals INTEGER,
+        ft_result CHAR(1),  -- H, D, A
+        home_shots INTEGER,
+        away_shots INTEGER,
+        home_shots_on_target INTEGER,
+        away_shots_on_target INTEGER,
+        home_corners INTEGER,
+        away_corners INTEGER,
+        home_yellow_cards INTEGER,
+        away_yellow_cards INTEGER,
+        home_red_cards INTEGER,
+        away_red_cards INTEGER,
+        division VARCHAR(10),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     
-    -- Create index on match_date for time-series queries
-    CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(match_date);
-    CREATE INDEX IF NOT EXISTS idx_matches_season ON matches(season_code);
+    -- Create hypertable for matches (time-series optimization)
+    SELECT create_hypertable('matches', 'match_date', if_not_exists => TRUE);
+    
+    -- Indexes for common queries
     CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches(home_team, away_team);
-    """
+    CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(match_date DESC);
     
-    CREATE_ODDS_TABLE = """
+    -- Odds table
     CREATE TABLE IF NOT EXISTS odds (
-        odds_id SERIAL PRIMARY KEY,
-        match_id INTEGER REFERENCES matches(match_id) ON DELETE CASCADE,
-        
-        -- Bookmaker identifiers
-        bookmaker VARCHAR(50) NOT NULL,  -- e.g., 'B365', 'Pinnacle', 'WilliamHill'
-        
-        -- Decimal odds
-        home_win_odds DECIMAL(10, 4),
-        draw_odds DECIMAL(10, 4),
-        away_win_odds DECIMAL(10, 4),
-        
-        -- Implied probabilities (fair, vig removed)
-        fair_prob_home DECIMAL(10, 6),
-        fair_prob_draw DECIMAL(10, 6),
-        fair_prob_away DECIMAL(10, 6),
-        
-        -- Bookmaker margin
-        bookmaker_margin DECIMAL(10, 6),
-        
-        -- Timestamps
-        odds_timestamp TIMESTAMPTZ DEFAULT NOW(),
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        
-        UNIQUE(match_id, bookmaker, odds_timestamp)
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER REFERENCES matches(id) ON DELETE CASCADE,
+        bookmaker VARCHAR(50) DEFAULT 'Bet365',
+        odds_home DECIMAL(5,2),
+        odds_draw DECIMAL(5,2),
+        odds_away DECIMAL(5,2),
+        recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(match_id, bookmaker, recorded_at)
     );
     
-    -- Index for quick odds lookups
     CREATE INDEX IF NOT EXISTS idx_odds_match ON odds(match_id);
     CREATE INDEX IF NOT EXISTS idx_odds_bookmaker ON odds(bookmaker);
-    """
     
-    CREATE_LLM_SIGNALS_TABLE = """
+    -- LLM Qualitative Signals table
     CREATE TABLE IF NOT EXISTS llm_qualitative_signals (
-        signal_id SERIAL PRIMARY KEY,
-        article_id VARCHAR(100) UNIQUE NOT NULL,
-        
-        -- Article metadata
-        source VARCHAR(100) NOT NULL,
-        title TEXT,
-        published_at TIMESTAMPTZ NOT NULL,
-        link TEXT,
-        
-        -- Teams mentioned
-        teams_mentioned TEXT[],  -- Array of team names
-        
-        -- Quantitative metrics from LLM
-        key_absences_impact DECIMAL(5, 2) CHECK (key_absences_impact BETWEEN 0 AND 10),
-        fatigue_rotation_risk DECIMAL(5, 2) CHECK (fatigue_rotation_risk BETWEEN 0 AND 10),
-        morale_sentiment_score DECIMAL(5, 2) CHECK (morale_sentiment_score BETWEEN -5 AND 5),
-        
-        -- Qualitative summary
+        id SERIAL PRIMARY KEY,
+        article_title TEXT NOT NULL,
+        source VARCHAR(100),
+        published_date TIMESTAMP,
+        key_absences_impact DECIMAL(3,1) CHECK (key_absences_impact BETWEEN 0 AND 10),
+        fatigue_rotation_risk DECIMAL(3,1) CHECK (fatigue_rotation_risk BETWEEN 0 AND 10),
+        morale_sentiment_score DECIMAL(3,1) CHECK (morale_sentiment_score BETWEEN -5 AND 5),
         tactical_summary TEXT,
-        
-        -- Quality metrics
-        confidence_score DECIMAL(5, 4) CHECK (confidence_score BETWEEN 0 AND 1),
-        
-        -- Raw payload for audit
-        raw_json_payload JSONB,
-        
-        -- Timestamps
-        ingested_at TIMESTAMPTZ DEFAULT NOW(),
-        
-        -- Index on teams for fast filtering
-        INDEX idx_llm_teams USING GIN (teams_mentioned)
+        teams_mentioned TEXT[],  -- Array of team names
+        confidence_score DECIMAL(3,2) CHECK (confidence_score BETWEEN 0 AND 1),
+        raw_json JSONB,  -- Full LLM response for debugging
+        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     
-    -- Time-based index for recent signals
-    CREATE INDEX IF NOT EXISTS idx_llm_published ON llm_qualitative_signals(published_at);
-    CREATE INDEX IF NOT EXISTS idx_llm_source ON llm_qualitative_signals(source);
-    """
+    CREATE INDEX IF NOT EXISTS idx_llm_teams ON llm_qualitative_signals USING GIN(teams_mentioned);
+    CREATE INDEX IF NOT EXISTS idx_llm_published ON llm_qualitative_signals(published_date DESC);
     
-    CREATE_MODEL_PREDICTIONS_TABLE = """
+    -- Model Predictions table
     CREATE TABLE IF NOT EXISTS model_predictions (
-        prediction_id SERIAL PRIMARY KEY,
-        match_id INTEGER REFERENCES matches(match_id) ON DELETE CASCADE,
-        
-        -- Model version tracking
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER REFERENCES matches(id),
         model_version VARCHAR(50) NOT NULL,
-        model_type VARCHAR(50) NOT NULL,  -- 'xgb_base', 'hybrid_meta'
-        
-        -- Probability outputs
-        prob_home DECIMAL(10, 6) NOT NULL,
-        prob_draw DECIMAL(10, 6) NOT NULL,
-        prob_away DECIMAL(10, 6) NOT NULL,
-        
-        -- Calibration info
-        calibration_method VARCHAR(50),
-        is_calibrated BOOLEAN DEFAULT FALSE,
-        
-        -- Edge calculation
-        edge_home DECIMAL(10, 6),
-        edge_draw DECIMAL(10, 6),
-        edge_away DECIMAL(10, 6),
-        
-        -- Recommended bet (if any)
-        recommended_outcome VARCHAR(10),
-        recommended_stake DECIMAL(10, 4),
-        kelly_fraction DECIMAL(5, 4),
-        
-        -- Timestamps
-        predicted_at TIMESTAMPTZ DEFAULT NOW(),
-        
-        UNIQUE(match_id, model_version, model_type)
+        prob_home DECIMAL(5,4),
+        prob_draw DECIMAL(5,4),
+        prob_away DECIMAL(5,4),
+        predicted_outcome CHAR(1),  -- H, D, A
+        edge_home DECIMAL(7,4),
+        edge_draw DECIMAL(7,4),
+        edge_away DECIMAL(7,4),
+        recommended_stake DECIMAL(5,4),
+        kelly_fraction DECIMAL(5,4),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     
     CREATE INDEX IF NOT EXISTS idx_predictions_match ON model_predictions(match_id);
-    CREATE INDEX IF NOT EXISTS idx_predictions_model ON model_predictions(model_type);
+    CREATE INDEX IF NOT EXISTS idx_predictions_model ON model_predictions(model_version);
+    CREATE INDEX IF NOT EXISTS idx_predictions_created ON model_predictions(created_at DESC);
     """
     
-    def __init__(self, connection_string: str = None):
-        self.connection_string = connection_string or config.database.connection_string
-        self._initialize_timescale_extension()
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5432,
+        database: str = "project_augo",
+        user: str = "postgres",
+        password: str = "your_password_here",
+        min_connections: int = 2,
+        max_connections: int = 10
+    ):
+        """
+        Initialize database manager with connection pool.
+        
+        Args:
+            host: PostgreSQL host
+            port: PostgreSQL port
+            database: Database name
+            user: Database user
+            password: Database password
+            min_connections: Minimum pool size
+            max_connections: Maximum pool size
+        """
+        self.host = host
+        self.port = port
+        self.database = database
+        self.user = user
+        self.password = password
+        
+        self.connection_pool: Optional[pool.SimpleConnectionPool] = None
+        self._initialize_pool(min_connections, max_connections)
     
-    def _initialize_timescale_extension(self):
-        """Ensure TimescaleDB extension is available."""
+    def _initialize_pool(self, min_conn: int, max_conn: int):
+        """Initialize the connection pool"""
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
-                    conn.commit()
-                    logger.info("TimescaleDB extension initialized")
+            self.connection_pool = pool.SimpleConnectionPool(
+                minconn=min_conn,
+                maxconn=max_conn,
+                host=self.host,
+                port=self.port,
+                database=self.database,
+                user=self.user,
+                password=self.password
+            )
+            logger.info(f"✓ Database connection pool initialized ({min_conn}-{max_conn} connections)")
         except Exception as e:
-            logger.warning(f"Could not initialize TimescaleDB extension: {e}")
+            logger.error(f"Failed to initialize connection pool: {e}")
+            raise
     
     @contextmanager
     def get_connection(self):
-        """Context manager for database connections."""
-        conn = None
+        """Context manager for database connections"""
+        if self.connection_pool is None:
+            raise RuntimeError("Connection pool not initialized")
+        
+        conn = self.connection_pool.getconn()
         try:
-            conn = psycopg2.connect(self.connection_string)
             yield conn
         finally:
-            if conn is not None:
-                conn.close()
+            self.connection_pool.putconn(conn)
     
     @contextmanager
-    def get_cursor(self, commit: bool = False):
-        """Context manager for database cursors with optional commit."""
+    def get_cursor(self, dict_cursor: bool = True):
+        """Context manager for database cursors"""
         with self.get_connection() as conn:
-            cur = None
+            cursor_type = RealDictCursor if dict_cursor else psycopg2.Cursor
+            cursor = conn.cursor(cursor_factory=cursor_type)
             try:
-                cur = conn.cursor(cursor_factory=extras.RealDictCursor)
-                yield cur
-                if commit:
-                    conn.commit()
+                yield cursor
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"Database transaction failed: {e}")
+                raise
             finally:
-                if cur is not None:
-                    cur.close()
+                cursor.close()
     
     def initialize_schema(self):
-        """Create all tables if they don't exist (idempotent)."""
+        """Create all tables and indexes (idempotent)"""
         logger.info("Initializing database schema...")
         
-        with self.get_cursor(commit=True) as cur:
-            # Create tables in order (respecting foreign keys)
-            cur.execute(self.CREATE_MATCHES_TABLE)
-            logger.info("Created matches table")
-            
-            cur.execute(self.CREATE_ODDS_TABLE)
-            logger.info("Created odds table")
-            
-            cur.execute(self.CREATE_LLM_SIGNALS_TABLE)
-            logger.info("Created llm_qualitative_signals table")
-            
-            cur.execute(self.CREATE_MODEL_PREDICTIONS_TABLE)
-            logger.info("Created model_predictions table")
-        
-        logger.info("Database schema initialization complete")
+        try:
+            with self.get_cursor() as cursor:
+                # Execute each statement separately
+                statements = [s.strip() for s in self.SCHEMA_SQL.split(';') if s.strip()]
+                
+                for stmt in statements:
+                    if stmt:
+                        cursor.execute(stmt)
+                
+                logger.info("✓ Database schema initialized successfully")
+                
+        except Exception as e:
+            logger.error(f"Schema initialization failed: {e}")
+            raise
     
-    def insert_match(self, match_data: Dict) -> Optional[int]:
+    # ==================== MATCHES ====================
+    
+    def insert_matches(self, matches_data: List[Dict[str, Any]]) -> int:
         """
-        Insert a single match record.
+        Insert multiple matches (upsert on conflict).
         
-        Returns:
-            match_id if inserted, None if duplicate
+        Returns number of inserted/updated rows.
         """
+        if not matches_data:
+            return 0
+        
         query = """
         INSERT INTO matches (
-            match_date, season_code, home_team, away_team,
-            ht_home_goals, ht_away_goals, ft_home_goals, ft_away_goals,
-            result, home_shots, away_shots, home_shots_on_target,
-            away_shots_on_target, home_corners, away_corners,
-            home_yellow_cards, away_yellow_cards, home_red_cards,
-            away_red_cards, goal_difference, total_goals
+            match_date, home_team, away_team,
+            ft_home_goals, ft_away_goals, ht_home_goals, ht_away_goals, ft_result,
+            home_shots, away_shots, home_shots_on_target, away_shots_on_target,
+            home_corners, away_corners,
+            home_yellow_cards, away_yellow_cards, home_red_cards, away_red_cards,
+            division
         ) VALUES (
-            %(match_date)s, %(season_code)s, %(home_team)s, %(away_team)s,
-            %(ht_home_goals)s, %(ht_away_goals)s, %(ft_home_goals)s, %(ft_away_goals)s,
-            %(result)s, %(home_shots)s, %(away_shots)s, %(home_shots_on_target)s,
-            %(away_shots_on_target)s, %(home_corners)s, %(away_corners)s,
-            %(home_yellow_cards)s, %(away_yellow_cards)s, %(home_red_cards)s,
-            %(away_red_cards)s, %(goal_difference)s, %(total_goals)s
+            %(match_date)s, %(home_team)s, %(away_team)s,
+            %(ft_home_goals)s, %(ft_away_goals)s, %(ht_home_goals)s, %(ht_away_goals)s, %(ft_result)s,
+            %(home_shots)s, %(away_shots)s, %(home_shots_on_target)s, %(away_shots_on_target)s,
+            %(home_corners)s, %(away_corners)s,
+            %(home_yellow_cards)s, %(away_yellow_cards)s, %(home_red_cards)s, %(away_red_cards)s,
+            %(division)s
         )
-        ON CONFLICT (match_date, home_team, away_team) 
-        DO UPDATE SET
-            ft_home_goals = EXCLUDED.ft_home_goals,
-            ft_away_goals = EXCLUDED.ft_away_goals,
-            result = EXCLUDED.result,
-            updated_at = NOW()
-        RETURNING match_id;
+        ON CONFLICT DO NOTHING
+        RETURNING id
         """
         
-        with self.get_cursor(commit=True) as cur:
-            cur.execute(query, match_data)
-            result = cur.fetchone()
-            return result['match_id'] if result else None
+        inserted = 0
+        with self.get_cursor() as cursor:
+            for match in matches_data:
+                try:
+                    cursor.execute(query, match)
+                    inserted += 1
+                except Exception as e:
+                    logger.warning(f"Failed to insert match: {e}")
+        
+        logger.info(f"✓ Inserted {inserted} matches")
+        return inserted
     
-    def insert_matches_batch(self, matches: List[Dict]) -> int:
-        """
-        Batch insert multiple matches.
+    def get_matches(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        team: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Fetch matches with optional filtering"""
+        if team:
+            query = """
+            SELECT * FROM matches
+            WHERE home_team = %(team)s OR away_team = %(team)s
+            ORDER BY match_date DESC
+            LIMIT %(limit)s OFFSET %(offset)s
+            """
+        else:
+            query = """
+            SELECT * FROM matches
+            ORDER BY match_date DESC
+            LIMIT %(limit)s OFFSET %(offset)s
+            """
         
-        Returns:
-            Number of successfully inserted matches
-        """
+        with self.get_cursor(dict_cursor=True) as cursor:
+            cursor.execute(query, {'limit': limit, 'offset': offset, 'team': team})
+            return cursor.fetchall()
+    
+    # ==================== ODDS ====================
+    
+    def insert_odds(self, match_id: int, odds_data: Dict[str, Any]) -> int:
+        """Insert odds for a match"""
         query = """
-        INSERT INTO matches (
-            match_date, season_code, home_team, away_team,
-            ht_home_goals, ht_away_goals, ft_home_goals, ft_away_goals,
-            result, home_shots, away_shots, home_shots_on_target,
-            away_shots_on_target, home_corners, away_corners,
-            goal_difference, total_goals
-        ) VALUES %s
-        ON CONFLICT (match_date, home_team, away_team) DO NOTHING;
+        INSERT INTO odds (match_id, odds_home, odds_draw, odds_away, bookmaker)
+        VALUES (%(match_id)s, %(odds_home)s, %(odds_draw)s, %(odds_away)s, %(bookmaker)s)
+        ON CONFLICT (match_id, bookmaker, recorded_at) DO UPDATE SET
+            odds_home = EXCLUDED.odds_home,
+            odds_draw = EXCLUDED.odds_draw,
+            odds_away = EXCLUDED.odds_away,
+            recorded_at = CURRENT_TIMESTAMP
+        RETURNING id
         """
         
-        values = [
-            (
-                m.get('match_date'), m.get('season_code'),
-                m.get('home_team'), m.get('away_team'),
-                m.get('ht_home_goals', 0), m.get('ht_away_goals', 0),
-                m.get('ft_home_goals', 0), m.get('ft_away_goals', 0),
-                m.get('result'), m.get('home_shots', 0), m.get('away_shots', 0),
-                m.get('home_shots_on_target', 0), m.get('away_shots_on_target', 0),
-                m.get('home_corners', 0), m.get('away_corners', 0),
-                m.get('goal_difference', 0), m.get('total_goals', 0)
-            )
-            for m in matches
-        ]
+        odds_data['match_id'] = match_id
         
-        with self.get_cursor(commit=True) as cur:
-            extras.execute_values(cur, query, values)
-            return len(values)
+        with self.get_cursor() as cursor:
+            cursor.execute(query, odds_data)
+            result = cursor.fetchone()
+            return result['id'] if result else 0
     
-    def insert_odds(self, match_id: int, odds_data: Dict) -> Optional[int]:
-        """Insert odds record for a match."""
-        query = """
-        INSERT INTO odds (
-            match_id, bookmaker, home_win_odds, draw_odds, away_win_odds,
-            fair_prob_home, fair_prob_draw, fair_prob_away, bookmaker_margin
-        ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s
-        )
-        ON CONFLICT (match_id, bookmaker, odds_timestamp) DO NOTHING
-        RETURNING odds_id;
-        """
-        
-        values = (
-            match_id,
-            odds_data.get('bookmaker'),
-            odds_data.get('home_win_odds'),
-            odds_data.get('draw_odds'),
-            odds_data.get('away_win_odds'),
-            odds_data.get('fair_prob_home'),
-            odds_data.get('fair_prob_draw'),
-            odds_data.get('fair_prob_away'),
-            odds_data.get('bookmaker_margin')
-        )
-        
-        with self.get_cursor(commit=True) as cur:
-            cur.execute(query, values)
-            result = cur.fetchone()
-            return result['odds_id'] if result else None
-    
-    def insert_llm_signal(self, signal_data: Dict) -> Optional[int]:
-        """Insert LLM qualitative signal."""
-        query = """
-        INSERT INTO llm_qualitative_signals (
-            article_id, source, title, published_at, link,
-            teams_mentioned, key_absences_impact, fatigue_rotation_risk,
-            morale_sentiment_score, tactical_summary, confidence_score,
-            raw_json_payload
-        ) VALUES (
-            %(article_id)s, %(source)s, %(title)s, %(published_at)s, %(link)s,
-            %(teams_mentioned)s, %(key_absences_impact)s, %(fatigue_rotation_risk)s,
-            %(morale_sentiment_score)s, %(tactical_summary)s, %(confidence_score)s,
-            %(raw_json_payload)s
-        )
-        ON CONFLICT (article_id) DO UPDATE SET
-            confidence_score = EXCLUDED.confidence_score,
-            ingested_at = NOW()
-        RETURNING signal_id;
-        """
-        
-        with self.get_cursor(commit=True) as cur:
-            cur.execute(query, signal_data)
-            result = cur.fetchone()
-            return result['signal_id'] if result else None
-    
-    def insert_llm_signals_batch(self, signals: List[Dict]) -> int:
-        """Batch insert multiple LLM signals."""
-        query = """
-        INSERT INTO llm_qualitative_signals (
-            article_id, source, title, published_at, link,
-            teams_mentioned, key_absences_impact, fatigue_rotation_risk,
-            morale_sentiment_score, tactical_summary, confidence_score
-        ) VALUES %s
-        ON CONFLICT (article_id) DO NOTHING;
-        """
-        
-        values = [
-            (
-                s.get('article_id'), s.get('source'), s.get('title'),
-                s.get('published_at'), s.get('link'),
-                s.get('teams_mentioned', []),
-                s.get('key_absences_impact'), s.get('fatigue_rotation_risk'),
-                s.get('morale_sentiment_score'), s.get('tactical_summary'),
-                s.get('confidence_score')
-            )
-            for s in signals
-        ]
-        
-        with self.get_cursor(commit=True) as cur:
-            extras.execute_values(cur, query, values)
-            return len(values)
-    
-    def insert_prediction(self, prediction_data: Dict) -> Optional[int]:
-        """Insert model prediction."""
-        query = """
-        INSERT INTO model_predictions (
-            match_id, model_version, model_type,
-            prob_home, prob_draw, prob_away,
-            calibration_method, is_calibrated,
-            edge_home, edge_draw, edge_away,
-            recommended_outcome, recommended_stake, kelly_fraction
-        ) VALUES (
-            %(match_id)s, %(model_version)s, %(model_type)s,
-            %(prob_home)s, %(prob_draw)s, %(prob_away)s,
-            %(calibration_method)s, %(is_calibrated)s,
-            %(edge_home)s, %(edge_draw)s, %(edge_away)s,
-            %(recommended_outcome)s, %(recommended_stake)s, %(kelly_fraction)s
-        )
-        ON CONFLICT (match_id, model_version, model_type) DO UPDATE SET
-            prob_home = EXCLUDED.prob_home,
-            prob_draw = EXCLUDED.prob_draw,
-            prob_away = EXCLUDED.prob_away,
-            predicted_at = NOW()
-        RETURNING prediction_id;
-        """
-        
-        with self.get_cursor(commit=True) as cur:
-            cur.execute(query, prediction_data)
-            result = cur.fetchone()
-            return result['prediction_id'] if result else None
-    
-    def get_recent_matches(self, limit: int = 100) -> List[Dict]:
-        """Fetch recent matches for analysis."""
-        query = """
-        SELECT * FROM matches
-        ORDER BY match_date DESC
-        LIMIT %s;
-        """
-        
-        with self.get_cursor() as cur:
-            cur.execute(query, (limit,))
-            return list(cur.fetchall())
-    
-    def get_upcoming_matches(self, days_ahead: int = 7) -> List[Dict]:
-        """Fetch upcoming matches without results."""
-        query = """
-        SELECT * FROM matches
-        WHERE match_date >= CURRENT_DATE
-        AND match_date <= CURRENT_DATE + INTERVAL '%s days'
-        AND result IS NULL
-        ORDER BY match_date ASC;
-        """
-        
-        with self.get_cursor() as cur:
-            cur.execute(query, (days_ahead,))
-            return list(cur.fetchall())
-    
-    def get_team_recent_signals(self, team_name: str, days_back: int = 7) -> List[Dict]:
-        """Get recent LLM signals mentioning a specific team."""
-        query = """
-        SELECT * FROM llm_qualitative_signals
-        WHERE %s = ANY(teams_mentioned)
-        AND published_at >= CURRENT_DATE - INTERVAL '%s days'
-        ORDER BY published_at DESC;
-        """
-        
-        with self.get_cursor() as cur:
-            cur.execute(query, (team_name, days_back))
-            return list(cur.fetchall())
-    
-    def get_latest_odds_for_match(self, match_id: int) -> Optional[Dict]:
-        """Get the most recent odds for a specific match."""
+    def get_odds_for_match(self, match_id: int) -> Optional[Dict[str, Any]]:
+        """Get latest odds for a specific match"""
         query = """
         SELECT * FROM odds
-        WHERE match_id = %s
-        ORDER BY odds_timestamp DESC
-        LIMIT 1;
+        WHERE match_id = %(match_id)s
+        ORDER BY recorded_at DESC
+        LIMIT 1
         """
         
-        with self.get_cursor() as cur:
-            cur.execute(query, (match_id,))
-            return cur.fetchone()
+        with self.get_cursor(dict_cursor=True) as cursor:
+            cursor.execute(query, {'match_id': match_id})
+            return cursor.fetchone()
     
-    def truncate_all_tables(self):
-        """WARNING: Delete all data from all tables. Use with caution."""
-        logger.warning("Truncating all tables!")
+    # ==================== LLM SIGNALS ====================
+    
+    def insert_llm_signal(self, signal_data: Dict[str, Any]) -> int:
+        """Insert a qualitative signal from LLM parsing"""
+        query = """
+        INSERT INTO llm_qualitative_signals (
+            article_title, source, published_date,
+            key_absences_impact, fatigue_rotation_risk, morale_sentiment_score,
+            tactical_summary, teams_mentioned, confidence_score, raw_json
+        ) VALUES (
+            %(article_title)s, %(source)s, %(published_date)s,
+            %(key_absences_impact)s, %(fatigue_rotation_risk)s, %(morale_sentiment_score)s,
+            %(tactical_summary)s, %(teams_mentioned)s, %(confidence_score)s, %(raw_json)s
+        )
+        RETURNING id
+        """
         
-        with self.get_cursor(commit=True) as cur:
-            cur.execute("TRUNCATE TABLE model_predictions, llm_qualitative_signals, odds, matches RESTART IDENTITY CASCADE;")
+        with self.get_cursor() as cursor:
+            cursor.execute(query, signal_data)
+            result = cursor.fetchone()
+            return result['id'] if result else 0
+    
+    def get_signals_for_team(
+        self,
+        team_name: str,
+        days_back: int = 7
+    ) -> List[Dict[str, Any]]:
+        """Get recent LLM signals mentioning a specific team"""
+        query = """
+        SELECT * FROM llm_qualitative_signals
+        WHERE %(team)s = ANY(teams_mentioned)
+        AND published_date >= NOW() - INTERVAL '%(days)s days'
+        ORDER BY published_date DESC
+        """
         
-        logger.info("All tables truncated")
+        with self.get_cursor(dict_cursor=True) as cursor:
+            cursor.execute(query, {'team': team_name, 'days': days_back})
+            return cursor.fetchall()
+    
+    def get_average_signals_for_match(
+        self,
+        home_team: str,
+        away_team: str,
+        days_back: int = 7
+    ) -> Dict[str, float]:
+        """
+        Get averaged qualitative signals for both teams in a match.
+        Returns aggregated metrics for fusion with ML model.
+        """
+        query = """
+        SELECT 
+            AVG(key_absences_impact) as avg_absences,
+            AVG(fatigue_rotation_risk) as avg_fatigue,
+            AVG(morale_sentiment_score) as avg_morale
+        FROM llm_qualitative_signals
+        WHERE (%(home)s = ANY(teams_mentioned) OR %(away)s = ANY(teams_mentioned))
+        AND published_date >= NOW() - INTERVAL '%(days)s days'
+        """
+        
+        with self.get_cursor(dict_cursor=True) as cursor:
+            cursor.execute(query, {'home': home_team, 'away': away_team, 'days': days_back})
+            result = cursor.fetchone()
+            
+            return {
+                'avg_absences_impact': float(result['avg_absences']) if result['avg_absences'] else 5.0,
+                'avg_fatigue_risk': float(result['avg_fatigue']) if result['avg_fatigue'] else 5.0,
+                'avg_morale_score': float(result['avg_morale']) if result['avg_morale'] else 0.0,
+            }
+    
+    # ==================== PREDICTIONS ====================
+    
+    def save_prediction(self, prediction_data: Dict[str, Any]) -> int:
+        """Save model prediction to database"""
+        query = """
+        INSERT INTO model_predictions (
+            match_id, model_version,
+            prob_home, prob_draw, prob_away, predicted_outcome,
+            edge_home, edge_draw, edge_away,
+            recommended_stake, kelly_fraction
+        ) VALUES (
+            %(match_id)s, %(model_version)s,
+            %(prob_home)s, %(prob_draw)s, %(prob_away)s, %(predicted_outcome)s,
+            %(edge_home)s, %(edge_draw)s, %(edge_away)s,
+            %(recommended_stake)s, %(kelly_fraction)s
+        )
+        RETURNING id
+        """
+        
+        with self.get_cursor() as cursor:
+            cursor.execute(query, prediction_data)
+            result = cursor.fetchone()
+            return result['id'] if result else 0
+    
+    def get_recent_predictions(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get most recent predictions"""
+        query = """
+        SELECT p.*, m.home_team, m.away_team, m.match_date
+        FROM model_predictions p
+        JOIN matches m ON p.match_id = m.id
+        ORDER BY p.created_at DESC
+        LIMIT %(limit)s
+        """
+        
+        with self.get_cursor(dict_cursor=True) as cursor:
+            cursor.execute(query, {'limit': limit})
+            return cursor.fetchall()
+    
+    def close(self):
+        """Close all connections in the pool"""
+        if self.connection_pool:
+            self.connection_pool.closeall()
+            logger.info("✓ Database connections closed")
+
+
+# Example usage
+if __name__ == "__main__":
+    # Configure these for your Windows PostgreSQL installation
+    db = DatabaseManager(
+        host="localhost",
+        port=5432,
+        database="project_augo",
+        user="postgres",
+        password="your_password_here"
+    )
+    
+    # Initialize schema (creates tables)
+    db.initialize_schema()
+    
+    print("\n✓ Database ready!")
